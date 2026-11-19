@@ -2,9 +2,11 @@ name: Build
 
 on:
   push:
-    branches: [main, master]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -12,16 +14,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      # Если проект загрузили в репозиторий одним .zip-архивом — распаковываем его
+      - name: Unpack zip archives (if pom.xml is missing)
+        run: |
+          if [ -z "$(find . -name pom.xml -not -path './.git/*' | head -n 1)" ]; then
+            mkdir -p _unpacked
+            find . -iname '*.zip' -not -path './.git/*' -not -path './_unpacked/*' -print0 |
+              while IFS= read -r -d '' z; do
+                echo "Unpacking: $z"
+                unzip -oq "$z" -d _unpacked || true
+              done
+          fi
+
+      # Ищем pom.xml где угодно (в корне или во вложенной папке)
+      - name: Locate project
+        id: locate
+        run: |
+          POM=$(find . -name pom.xml -not -path './.git/*' -not -path '*/target/*' | head -n 1)
+          if [ -z "$POM" ]; then
+            echo "::error::pom.xml не найден в репозитории. Загрузите в репозиторий содержимое папки RtpAuction (pom.xml, src/, README.md), а не архив и не пустую папку."
+            echo "Содержимое репозитория:"
+            find . -not -path './.git/*' | head -n 100
+            exit 1
+          fi
+          DIR=$(dirname "$POM")
+          echo "Project dir: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
+          cache-dependency-path: ${{ steps.locate.outputs.dir }}/pom.xml
 
       - name: Build with Maven
-        run: mvn -B clean package
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: mvn -B -ntp clean package
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload plugin jar
+        uses: actions/upload-artifact@v4
         with:
           name: RtpAuction
-          path: target/RtpAuction-*.jar
+          path: ${{ steps.locate.outputs.dir }}/target/*.jar
+          if-no-files-found: error
