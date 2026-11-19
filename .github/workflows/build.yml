@@ -8,14 +8,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      # Если проект загрузили в репозиторий одним .zip-архивом — распаковываем его
-      - name: Unpack zip archives (if pom.xml is missing)
+      # Если проект загрузили в репозиторий .zip-архивом — распаковываем его
+      - name: Unpack zip archives (only if pom.xml is missing)
         run: |
           if [ -z "$(find . -name pom.xml -not -path './.git/*' | head -n 1)" ]; then
             mkdir -p _unpacked
@@ -26,13 +31,14 @@ jobs:
               done
           fi
 
-      # Ищем pom.xml где угодно (в корне или во вложенной папке)
+      # Ищем pom.xml (берём самый "верхний", если их несколько)
       - name: Locate project
         id: locate
         run: |
-          POM=$(find . -name pom.xml -not -path './.git/*' -not -path '*/target/*' | head -n 1)
+          POM=$(find . -name pom.xml -not -path './.git/*' -not -path '*/target/*' \
+                | awk '{print gsub("/","/"), $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
           if [ -z "$POM" ]; then
-            echo "::error::pom.xml не найден в репозитории. Загрузите в репозиторий содержимое папки RtpAuction (pom.xml, src/, README.md), а не архив и не пустую папку."
+            echo "::error::pom.xml не найден. Загрузите в репозиторий содержимое папки RtpAuction (pom.xml, src/, .github/), а не пустую папку."
             echo "Содержимое репозитория:"
             find . -not -path './.git/*' | head -n 100
             exit 1
@@ -48,13 +54,36 @@ jobs:
           cache: maven
           cache-dependency-path: ${{ steps.locate.outputs.dir }}/pom.xml
 
+      # 3 попытки: репозитории (papermc / jitpack) иногда отвечают с ошибкой
       - name: Build with Maven
         working-directory: ${{ steps.locate.outputs.dir }}
-        run: mvn -B -ntp clean package
+        run: |
+          for i in 1 2 3; do
+            mvn -B -ntp clean package && exit 0
+            echo "::warning::Сборка не удалась (попытка $i из 3), повторяю..."
+            sleep 15
+          done
+          echo "::error::Сборка Maven не удалась после 3 попыток. Смотрите ошибку выше."
+          exit 1
+
+      # Проверка, что в jar попало всё нужное (и что это версия 1.4+, а не старый код)
+      - name: Verify jar
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          JAR=$(ls target/*.jar 2>/dev/null | head -n 1)
+          if [ -z "$JAR" ]; then echo "::error::jar не найден в target/"; exit 1; fi
+          echo "Jar: $JAR"
+          unzip -l "$JAR" | grep -q 'plugin.yml' || { echo "::error::В jar нет plugin.yml"; exit 1; }
+          unzip -l "$JAR" | grep -q 'dev/rtpauction/ResourcePackManager.class' || { echo "::error::В репозитории старый код: нет ResourcePackManager.java. Загрузите файлы версии 1.4.0."; exit 1; }
+          unzip -p "$JAR" AuctionNpcSkin_resourcepack.zip > /tmp/pack.zip 2>/dev/null || { echo "::error::В jar нет AuctionNpcSkin_resourcepack.zip (проверьте src/main/resources)"; exit 1; }
+          unzip -tq /tmp/pack.zip || { echo "::error::Ресурспак внутри jar повреждён (проверьте фильтрацию ресурсов в pom.xml)"; exit 1; }
+          echo "OK: jar собран корректно"
 
       - name: Upload plugin jar
         uses: actions/upload-artifact@v4
         with:
           name: RtpAuction
-          path: ${{ steps.locate.outputs.dir }}/target/*.jar
+          path: |
+            ${{ steps.locate.outputs.dir }}/target/*.jar
+            !${{ steps.locate.outputs.dir }}/target/original-*.jar
           if-no-files-found: error
